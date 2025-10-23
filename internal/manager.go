@@ -102,6 +102,9 @@ func NewManager(cfg *config.Config) (*Manager, error) {
 	// Set the config manager in the AI client
 	aiClient.SetConfigManager(manager)
 	aiClient.SetMCPManager(mcpManager)
+	aiClient.SetToolExecutionNotifier(func(server, tool string) {
+		manager.Println(fmt.Sprintf("Executing MCP tool: %s::%s", server, tool))
+	})
 
 	manager.confirmedToExec = manager.confirmedToExecFn
 	manager.getTmuxPanesInXml = manager.getTmuxPanesInXmlFn

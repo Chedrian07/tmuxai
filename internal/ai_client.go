@@ -23,6 +23,7 @@ type AiClient struct {
 	configMgr  *Manager // To access model configuration methods
 	mcpManager *mcp.Manager
 	client     *http.Client
+	notifyTool func(server, tool string)
 }
 
 // Message represents a chat message
@@ -112,7 +113,7 @@ type ResponseUsage struct {
 	TotalTokens     int `json:"total_tokens"`
 }
 
-const maxMCPToolIterations = 5
+const defaultMaxMCPToolIterations = 5
 
 var mcpToolCallRegex = regexp.MustCompile(`(?s)<MCPToolCall>(.*?)</MCPToolCall>`)
 
@@ -137,6 +138,11 @@ func (c *AiClient) SetConfigManager(mgr *Manager) {
 // SetMCPManager configures the manager for MCP tool access.
 func (c *AiClient) SetMCPManager(mgr *mcp.Manager) {
 	c.mcpManager = mgr
+}
+
+// SetToolExecutionNotifier registers a callback invoked before executing an MCP tool.
+func (c *AiClient) SetToolExecutionNotifier(fn func(server, tool string)) {
+	c.notifyTool = fn
 }
 
 // determineAPIType determines which API to use based on the model and configuration
@@ -197,8 +203,13 @@ func (c *AiClient) convertChatMessages(chatMessages []ChatMessage) []Message {
 
 func (c *AiClient) generateResponse(ctx context.Context, conversation []Message, model string) (string, error) {
 	history := append([]Message(nil), conversation...)
+	maxIterations := defaultMaxMCPToolIterations
 
-	for iteration := 0; iteration < maxMCPToolIterations; iteration++ {
+	if iter, ok := c.getIterationLimitFromModel(model); ok {
+		maxIterations = iter
+	}
+
+	for iteration := 0; iteration < maxIterations; iteration++ {
 		response, err := c.callModel(ctx, history, model)
 		if err != nil {
 			return "", err
@@ -227,7 +238,7 @@ func (c *AiClient) generateResponse(ctx context.Context, conversation []Message,
 		}
 	}
 
-	return "", fmt.Errorf("exceeded MCP tool call iteration limit (%d)", maxMCPToolIterations)
+	return "", fmt.Errorf("exceeded MCP tool call iteration limit (%d)", maxIterations)
 }
 
 func (c *AiClient) callModel(ctx context.Context, messages []Message, model string) (string, error) {
@@ -280,6 +291,9 @@ func (c *AiClient) executeMCPTool(ctx context.Context, call mcpToolCallSpec) (*m
 	if c.mcpManager == nil {
 		return nil, fmt.Errorf("no MCP manager configured")
 	}
+	if c.notifyTool != nil {
+		c.notifyTool(call.Server, call.Tool)
+	}
 	logger.Info("Executing MCP tool %s::%s", call.Server, call.Tool)
 	return c.mcpManager.CallTool(ctx, call.Server, call.Tool, call.Arguments)
 }
@@ -311,6 +325,13 @@ func (c *AiClient) formatMCPResult(call mcpToolCallSpec, result *mcp.ToolResult,
 		builder.WriteString("\n")
 	}
 	return strings.TrimSpace(builder.String())
+}
+
+func (c *AiClient) getIterationLimitFromModel(model string) (int, bool) {
+	if c.config != nil && c.config.MaxMCPToolIterations > 0 {
+		return c.config.MaxMCPToolIterations, true
+	}
+	return 0, false
 }
 
 // ChatCompletion sends a chat completion request to the OpenRouter API
