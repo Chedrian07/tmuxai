@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/alvinunreal/tmuxai/config"
+	"github.com/alvinunreal/tmuxai/logger"
 )
 
 // ConfigFilename is the expected name of the MCP configuration file.
@@ -50,6 +51,7 @@ func loadConfigFile(path string) (*Config, error) {
 		return nil, fmt.Errorf("MCP config %s does not contain any servers", path)
 	}
 
+	logger.Info("[MCP] Loaded configuration from %s with %d server(s)", path, len(cfg.Servers))
 	return cfg, nil
 }
 
@@ -78,6 +80,7 @@ func findConfigPath() (string, error) {
 
 	for _, p := range paths {
 		if _, err := os.Stat(p); err == nil {
+			logger.Debug("[MCP] Using configuration file %s", p)
 			return p, nil
 		}
 	}

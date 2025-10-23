@@ -14,7 +14,11 @@ import (
 
 // GetAvailablePane finds an available pane or creates a new one if none are available
 func (m *Manager) GetAvailablePane() system.TmuxPaneDetails {
-	panes, _ := m.GetTmuxPanes()
+	panes, err := m.GetTmuxPanes()
+	if err != nil {
+		logger.Error("Failed to enumerate tmux panes: %v", err)
+		return system.TmuxPaneDetails{}
+	}
 	for _, pane := range panes {
 		if !pane.IsTmuxAiPane {
 			logger.Info("Found available pane: %s", pane.Id)

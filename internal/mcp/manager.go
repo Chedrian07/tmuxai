@@ -37,12 +37,14 @@ func NewManager(ctx context.Context, opts Options) (*Manager, error) {
 	cfg, path, err := LoadConfig()
 	if err != nil {
 		if errors.Is(err, ErrConfigNotFound) {
+			logger.Debug("[MCP] No configuration file found, skipping MCP initialization")
 			return nil, nil
 		}
 		return nil, err
 	}
 
 	if cfg == nil || len(cfg.Servers) == 0 {
+		logger.Debug("[MCP] Configuration is empty, skipping MCP initialization")
 		return nil, nil
 	}
 
@@ -69,6 +71,7 @@ func NewManager(ctx context.Context, opts Options) (*Manager, error) {
 			continue
 		}
 
+		logger.Info("[MCP] Starting server %s (command: %s)", name, serverCfg.Command)
 		server, err := NewServer(ctx, name, serverCfg, m.clientName, m.clientVersion)
 		if err != nil {
 			logger.Error("[MCP] Failed to start server %s: %v", name, err)

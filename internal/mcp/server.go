@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	defaultProtocolVersion = "2025-03-26"
-	defaultRequestTimeout  = 60 * time.Second
+	defaultProtocolVersion  = "2025-03-26"
+	defaultRequestTimeout   = 60 * time.Second
+	defaultHandshakeTimeout = 60 * time.Second
 )
 
 // Tool describes a single tool provided by an MCP server.
@@ -232,11 +233,19 @@ func (s *Server) initialize(ctx context.Context, clientName, clientVersion strin
 		ServerInfo      map[string]interface{} `json:"serverInfo"`
 	}
 
-	if err := s.call(ctx, "initialize", params, &initResp); err != nil {
+	handshakeTimeout := defaultHandshakeTimeout
+	if s.cfg.Timeout > 0 {
+		handshakeTimeout = time.Duration(s.cfg.Timeout) * time.Second
+	}
+
+	logger.Info("[MCP:%s] Waiting up to %.0f seconds for initialize handshake", s.name, handshakeTimeout.Seconds())
+	if err := s.call(ctx, "initialize", params, &initResp, handshakeTimeout); err != nil {
 		return fmt.Errorf("initialize failed for MCP server %s: %w", s.name, err)
 	}
 
 	s.Instructions = strings.TrimSpace(initResp.Instructions)
+
+	logger.Info("[MCP:%s] Handshake completed", s.name)
 
 	// Send initialized notification
 	if err := s.notify("notifications/initialized", map[string]interface{}{}); err != nil {
@@ -245,8 +254,10 @@ func (s *Server) initialize(ctx context.Context, clientName, clientVersion strin
 
 	// List tools
 	var tools listToolsResult
-	if err := s.call(ctx, "tools/list", map[string]interface{}{}, &tools); err != nil {
-		return fmt.Errorf("tools/list failed for MCP server %s: %w", s.name, err)
+	if err := s.call(ctx, "tools/list", map[string]interface{}{}, &tools, handshakeTimeout); err != nil {
+		logger.Error("[MCP:%s] tools/list failed: %v (continuing without tools)", s.name, err)
+		// Allow servers that do not implement tools/list to continue.
+		return nil
 	}
 
 	for _, payload := range tools.Tools {
@@ -288,7 +299,7 @@ func (s *Server) handleNotification(msg jsonrpcMessage) {
 	}
 }
 
-func (s *Server) call(ctx context.Context, method string, params interface{}, result interface{}) error {
+func (s *Server) call(ctx context.Context, method string, params interface{}, result interface{}, timeout time.Duration) error {
 	id := atomic.AddInt64(&s.nextID, 1)
 	payload, err := marshalRequest(id, method, params)
 	if err != nil {
@@ -312,9 +323,8 @@ func (s *Server) call(ctx context.Context, method string, params interface{}, re
 		return err
 	}
 
-	timeout := defaultRequestTimeout
-	if s.cfg.Timeout > 0 {
-		timeout = time.Duration(s.cfg.Timeout) * time.Second
+	if timeout <= 0 {
+		timeout = defaultRequestTimeout
 	}
 
 	var timer <-chan time.Time
@@ -381,7 +391,12 @@ func (s *Server) CallTool(ctx context.Context, name string, args map[string]inte
 	}
 
 	var result callToolResult
-	if err := s.call(ctx, "tools/call", params, &result); err != nil {
+	operationTimeout := defaultRequestTimeout
+	if s.cfg.Timeout > 0 {
+		operationTimeout = time.Duration(s.cfg.Timeout) * time.Second
+	}
+
+	if err := s.call(ctx, "tools/call", params, &result, operationTimeout); err != nil {
 		return nil, err
 	}
 

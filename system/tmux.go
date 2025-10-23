@@ -110,7 +110,7 @@ var TmuxCapturePane = func(paneId string, maxLines int) (string, error) {
 }
 
 // Return current tmux window target with session id and window id
-func TmuxCurrentWindowTarget() (string, error) {
+var TmuxCurrentWindowTarget = func() (string, error) {
 	paneId, err := TmuxCurrentPaneId()
 	if err != nil {
 		return "", err
@@ -140,7 +140,22 @@ var TmuxCurrentPaneId = func() (string, error) {
 		return "", fmt.Errorf("TMUX_PANE environment variable not set")
 	}
 
-	return tmuxPane, nil
+	cmd := exec.Command("tmux", "display-message", "-p", "#{pane_id}")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		logger.Error("Failed to verify current tmux pane: %v, stderr: %s", err, stderr.String())
+		return "", fmt.Errorf("failed to verify tmux pane: %w", err)
+	}
+
+	pane := strings.TrimSpace(stdout.String())
+	if pane == "" {
+		return "", fmt.Errorf("tmux returned empty pane id")
+	}
+
+	return pane, nil
 }
 
 // CreateTmuxSession creates a new tmux session and returns the new pane id

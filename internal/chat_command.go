@@ -381,7 +381,12 @@ func (m *Manager) formatInfo() {
 	fmt.Println()
 	fmt.Println(formatter.FormatSection("Tmux Window Panes"))
 
-	panes, _ := m.GetTmuxPanes()
+	panes, err := m.GetTmuxPanes()
+	if err != nil {
+		logger.Error("Failed to get tmux panes: %v", err)
+		fmt.Println("Unable to retrieve tmux panes. Make sure Tmux is running.")
+		return
+	}
 	for _, pane := range panes {
 		pane.Refresh(m.GetMaxCaptureLines())
 		fmt.Println(pane.FormatInfo(formatter))

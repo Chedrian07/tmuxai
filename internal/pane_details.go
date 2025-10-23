@@ -5,13 +5,25 @@ import (
 	"strings"
 
 	"github.com/alvinunreal/tmuxai/config"
+	"github.com/alvinunreal/tmuxai/logger"
 	"github.com/alvinunreal/tmuxai/system"
 )
 
 func (m *Manager) GetTmuxPanes() ([]system.TmuxPaneDetails, error) {
-	currentPaneId, _ := system.TmuxCurrentPaneId()
-	windowTarget, _ := system.TmuxCurrentWindowTarget()
-	currentPanes, _ := system.TmuxPanesDetails(windowTarget)
+	currentPaneId, err := system.TmuxCurrentPaneId()
+	if err != nil {
+		return nil, err
+	}
+
+	windowTarget, err := system.TmuxCurrentWindowTarget()
+	if err != nil {
+		return nil, err
+	}
+
+	currentPanes, err := system.TmuxPanesDetails(windowTarget)
+	if err != nil {
+		return nil, err
+	}
 
 	for i := range currentPanes {
 		currentPanes[i].IsTmuxAiPane = currentPanes[i].Id == currentPaneId
@@ -30,7 +42,12 @@ func (m *Manager) GetTmuxPanes() ([]system.TmuxPaneDetails, error) {
 func (m *Manager) getTmuxPanesInXmlFn(config *config.Config) string {
 	currentTmuxWindow := strings.Builder{}
 	currentTmuxWindow.WriteString("<current_tmux_window_state>\n")
-	panes, _ := m.GetTmuxPanes()
+	panes, err := m.GetTmuxPanes()
+	if err != nil {
+		logger.Error("Failed to get tmux panes: %v", err)
+		currentTmuxWindow.WriteString("</current_tmux_window_state>\n")
+		return currentTmuxWindow.String()
+	}
 
 	// Filter out tmuxai_pane
 	var filteredPanes []system.TmuxPaneDetails
