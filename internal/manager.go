@@ -1,12 +1,14 @@
 package internal
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/alvinunreal/tmuxai/config"
+	"github.com/alvinunreal/tmuxai/internal/mcp"
 	"github.com/alvinunreal/tmuxai/logger"
 	"github.com/alvinunreal/tmuxai/system"
 	"github.com/fatih/color"
@@ -43,9 +45,10 @@ type Manager struct {
 	OS               string
 	SessionOverrides map[string]interface{} // session-only config overrides
 	LoadedKBs        map[string]string      // Loaded knowledge bases (name -> content)
+	MCPManager       *mcp.Manager           // Optional MCP manager
 
 	// Functions for mocking
-	confirmedToExec  func(command string, prompt string, edit bool) (bool, string)
+	confirmedToExec   func(command string, prompt string, edit bool) (bool, string)
 	getTmuxPanesInXml func(config *config.Config) string
 }
 
@@ -75,6 +78,15 @@ func NewManager(cfg *config.Config) (*Manager, error) {
 	aiClient := NewAiClient(cfg)
 	os := system.GetOSDetails()
 
+	var mcpManager *mcp.Manager
+	mcpManager, err = mcp.NewManager(context.Background(), mcp.Options{
+		ClientName:    "tmuxai",
+		ClientVersion: Version,
+	})
+	if err != nil {
+		logger.Error("Failed to initialize MCP manager: %v", err)
+	}
+
 	manager := &Manager{
 		Config:           cfg,
 		AiClient:         aiClient,
@@ -84,10 +96,12 @@ func NewManager(cfg *config.Config) (*Manager, error) {
 		OS:               os,
 		SessionOverrides: make(map[string]interface{}),
 		LoadedKBs:        make(map[string]string),
+		MCPManager:       mcpManager,
 	}
 
 	// Set the config manager in the AI client
 	aiClient.SetConfigManager(manager)
+	aiClient.SetMCPManager(mcpManager)
 
 	manager.confirmedToExec = manager.confirmedToExecFn
 	manager.getTmuxPanesInXml = manager.getTmuxPanesInXmlFn
@@ -98,6 +112,13 @@ func NewManager(cfg *config.Config) (*Manager, error) {
 	manager.autoLoadKBs()
 
 	return manager, nil
+}
+
+// Close releases associated resources.
+func (m *Manager) Close() {
+	if m.MCPManager != nil {
+		m.MCPManager.Close()
+	}
 }
 
 // Start starts the manager agent

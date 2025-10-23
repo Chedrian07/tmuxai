@@ -8,18 +8,21 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/alvinunreal/tmuxai/config"
+	"github.com/alvinunreal/tmuxai/internal/mcp"
 	"github.com/alvinunreal/tmuxai/logger"
 )
 
 // AiClient represents an AI client for interacting with OpenAI-compatible APIs including Azure OpenAI
 type AiClient struct {
-	config      *config.Config
-	configMgr   *Manager  // To access model configuration methods
-	client      *http.Client
+	config     *config.Config
+	configMgr  *Manager // To access model configuration methods
+	mcpManager *mcp.Manager
+	client     *http.Client
 }
 
 // Message represents a chat message
@@ -55,43 +58,43 @@ type ResponseInput interface{}
 
 // ResponseContent represents content in the Responses API
 type ResponseContent struct {
-	Type   string      `json:"type"`
-	Text   string      `json:"text,omitempty"`
+	Type        string        `json:"type"`
+	Text        string        `json:"text,omitempty"`
 	Annotations []interface{} `json:"annotations,omitempty"`
 }
 
 // ResponseOutputItem represents an output item in the Responses API
 type ResponseOutputItem struct {
-	ID      string           `json:"id"`
-	Type    string           `json:"type"` // "message", "reasoning", "function_call", etc.
-	Status  string           `json:"status,omitempty"` // "completed", "in_progress", etc.
+	ID      string            `json:"id"`
+	Type    string            `json:"type"`             // "message", "reasoning", "function_call", etc.
+	Status  string            `json:"status,omitempty"` // "completed", "in_progress", etc.
 	Content []ResponseContent `json:"content,omitempty"`
-	Role    string           `json:"role,omitempty"` // "assistant", "user", etc.
-	Summary []interface{}    `json:"summary,omitempty"`
+	Role    string            `json:"role,omitempty"` // "assistant", "user", etc.
+	Summary []interface{}     `json:"summary,omitempty"`
 }
 
 // ResponseRequest represents a request to the Responses API
 type ResponseRequest struct {
-	Model         string                 `json:"model"`
-	Input         ResponseInput          `json:"input"`
-	Instructions  string                 `json:"instructions,omitempty"`
-	Tools         []interface{}          `json:"tools,omitempty"`
-	PreviousResponseID string             `json:"previous_response_id,omitempty"`
-	Store         bool                   `json:"store,omitempty"`
-	Include       []string               `json:"include,omitempty"`
-	Text          map[string]interface{} `json:"text,omitempty"` // for structured outputs
+	Model              string                 `json:"model"`
+	Input              ResponseInput          `json:"input"`
+	Instructions       string                 `json:"instructions,omitempty"`
+	Tools              []interface{}          `json:"tools,omitempty"`
+	PreviousResponseID string                 `json:"previous_response_id,omitempty"`
+	Store              bool                   `json:"store,omitempty"`
+	Include            []string               `json:"include,omitempty"`
+	Text               map[string]interface{} `json:"text,omitempty"` // for structured outputs
 }
 
 // Response represents a response from the Responses API
 type Response struct {
-	ID                string               `json:"id"`
-	Object            string               `json:"object"`
-	CreatedAt         int64                `json:"created_at"`
-	Model             string               `json:"model"`
-	Output            []ResponseOutputItem `json:"output"`
-	OutputText        string               `json:"output_text,omitempty"`
-	Error             *ResponseError       `json:"error,omitempty"`
-	Usage             *ResponseUsage       `json:"usage,omitempty"`
+	ID         string               `json:"id"`
+	Object     string               `json:"object"`
+	CreatedAt  int64                `json:"created_at"`
+	Model      string               `json:"model"`
+	Output     []ResponseOutputItem `json:"output"`
+	OutputText string               `json:"output_text,omitempty"`
+	Error      *ResponseError       `json:"error,omitempty"`
+	Usage      *ResponseUsage       `json:"usage,omitempty"`
 }
 
 // ResponseError represents an error in the Responses API
@@ -103,10 +106,20 @@ type ResponseError struct {
 
 // ResponseUsage represents token usage in the Responses API
 type ResponseUsage struct {
-	InputTokens          int `json:"input_tokens"`
-	OutputTokens         int `json:"output_tokens"`
-	ReasoningTokens      int `json:"reasoning_tokens,omitempty"`
-	TotalTokens          int `json:"total_tokens"`
+	InputTokens     int `json:"input_tokens"`
+	OutputTokens    int `json:"output_tokens"`
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+	TotalTokens     int `json:"total_tokens"`
+}
+
+const maxMCPToolIterations = 5
+
+var mcpToolCallRegex = regexp.MustCompile(`(?s)<MCPToolCall>(.*?)</MCPToolCall>`)
+
+type mcpToolCallSpec struct {
+	Server    string                 `json:"server"`
+	Tool      string                 `json:"tool"`
+	Arguments map[string]interface{} `json:"arguments"`
 }
 
 func NewAiClient(cfg *config.Config) *AiClient {
@@ -119,6 +132,11 @@ func NewAiClient(cfg *config.Config) *AiClient {
 // SetConfigManager sets the configuration manager for accessing model configurations
 func (c *AiClient) SetConfigManager(mgr *Manager) {
 	c.configMgr = mgr
+}
+
+// SetMCPManager configures the manager for MCP tool access.
+func (c *AiClient) SetMCPManager(mgr *mcp.Manager) {
+	c.mcpManager = mgr
 }
 
 // determineAPIType determines which API to use based on the model and configuration
@@ -154,54 +172,145 @@ func (c *AiClient) determineAPIType(model string) string {
 	return "openrouter"
 }
 
-// GetResponseFromChatMessages gets a response from the AI based on chat messages
+// GetResponseFromChatMessages gets a response from the AI based on chat messages.
 func (c *AiClient) GetResponseFromChatMessages(ctx context.Context, chatMessages []ChatMessage, model string) (string, error) {
-	// Convert chat messages to AI client format
-	aiMessages := []Message{}
+	conversation := c.convertChatMessages(chatMessages)
+	return c.generateResponse(ctx, conversation, model)
+}
 
+func (c *AiClient) convertChatMessages(chatMessages []ChatMessage) []Message {
+	messages := make([]Message, 0, len(chatMessages))
 	for i, msg := range chatMessages {
-		var role string
-
+		role := "assistant"
 		if i == 0 && !msg.FromUser {
 			role = "system"
 		} else if msg.FromUser {
 			role = "user"
-		} else {
-			role = "assistant"
 		}
-
-		aiMessages = append(aiMessages, Message{
+		messages = append(messages, Message{
 			Role:    role,
 			Content: msg.Content,
 		})
 	}
+	return messages
+}
 
-	logger.Info("Sending %d messages to AI using model: %s", len(aiMessages), model)
+func (c *AiClient) generateResponse(ctx context.Context, conversation []Message, model string) (string, error) {
+	history := append([]Message(nil), conversation...)
 
-	// Determine which API to use
+	for iteration := 0; iteration < maxMCPToolIterations; iteration++ {
+		response, err := c.callModel(ctx, history, model)
+		if err != nil {
+			return "", err
+		}
+
+		toolCalls, err := extractMCPToolCalls(response)
+		if err != nil {
+			return "", err
+		}
+
+		if len(toolCalls) == 0 {
+			return response, nil
+		}
+
+		logger.Info("AI requested %d MCP tool call(s) on iteration %d", len(toolCalls), iteration+1)
+		history = append(history, Message{Role: "assistant", Content: response})
+
+		for _, call := range toolCalls {
+			result, callErr := c.executeMCPTool(ctx, call)
+			formatted := c.formatMCPResult(call, result, callErr)
+			logger.Debug("MCP tool %s::%s finished (err=%v)", call.Server, call.Tool, callErr)
+			history = append(history, Message{
+				Role:    "user",
+				Content: formatted,
+			})
+		}
+	}
+
+	return "", fmt.Errorf("exceeded MCP tool call iteration limit (%d)", maxMCPToolIterations)
+}
+
+func (c *AiClient) callModel(ctx context.Context, messages []Message, model string) (string, error) {
+	logger.Info("Sending %d messages to AI using model: %s", len(messages), model)
+
 	apiType := c.determineAPIType(model)
 	logger.Debug("Using API type: %s for model: %s", apiType, model)
 
-	// Route to appropriate API
-	var response string
-	var err error
-
 	switch apiType {
 	case "responses":
-		response, err = c.Response(ctx, aiMessages, model)
+		return c.Response(ctx, messages, model)
 	case "azure":
-		response, err = c.ChatCompletion(ctx, aiMessages, model)
+		return c.ChatCompletion(ctx, messages, model)
 	case "openrouter":
-		response, err = c.ChatCompletion(ctx, aiMessages, model)
+		return c.ChatCompletion(ctx, messages, model)
 	default:
 		return "", fmt.Errorf("unknown API type: %s", apiType)
 	}
+}
 
-	if err != nil {
-		return "", err
+func extractMCPToolCalls(response string) ([]mcpToolCallSpec, error) {
+	matches := mcpToolCallRegex.FindAllStringSubmatch(response, -1)
+	if len(matches) == 0 {
+		return nil, nil
 	}
 
-	return response, nil
+	calls := make([]mcpToolCallSpec, 0, len(matches))
+	for _, match := range matches {
+		raw := strings.TrimSpace(match[1])
+		if raw == "" {
+			continue
+		}
+
+		var spec mcpToolCallSpec
+		if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+			return nil, fmt.Errorf("failed to decode MCPToolCall payload: %w", err)
+		}
+		if spec.Arguments == nil {
+			spec.Arguments = map[string]interface{}{}
+		}
+		calls = append(calls, spec)
+	}
+	return calls, nil
+}
+
+func (c *AiClient) executeMCPTool(ctx context.Context, call mcpToolCallSpec) (*mcp.ToolResult, error) {
+	if strings.TrimSpace(call.Server) == "" || strings.TrimSpace(call.Tool) == "" {
+		return nil, fmt.Errorf("invalid MCP tool call payload: missing server or tool name")
+	}
+	if c.mcpManager == nil {
+		return nil, fmt.Errorf("no MCP manager configured")
+	}
+	logger.Info("Executing MCP tool %s::%s", call.Server, call.Tool)
+	return c.mcpManager.CallTool(ctx, call.Server, call.Tool, call.Arguments)
+}
+
+func (c *AiClient) formatMCPResult(call mcpToolCallSpec, result *mcp.ToolResult, callErr error) string {
+	if c.mcpManager != nil {
+		return c.mcpManager.FormatResultForModel(call.Server, call.Tool, result, callErr)
+	}
+
+	status := "success"
+	if callErr != nil {
+		status = "error: " + callErr.Error()
+	} else if result != nil && result.IsError {
+		status = "tool_reported_error"
+	}
+
+	var builder strings.Builder
+	builder.WriteString("[MCP RESULT]\n")
+	builder.WriteString(fmt.Sprintf("server: %s\n", call.Server))
+	builder.WriteString(fmt.Sprintf("tool: %s\n", call.Tool))
+	builder.WriteString(fmt.Sprintf("status: %s\n", status))
+	if result != nil {
+		text := strings.TrimSpace(result.Text)
+		if text == "" {
+			text = "(no textual output)"
+		}
+		builder.WriteString("output:\n")
+		builder.WriteString(text)
+		builder.WriteString("\n")
+	}
+	return strings.TrimSpace(builder.String())
 }
 
 // ChatCompletion sends a chat completion request to the OpenRouter API

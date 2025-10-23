@@ -608,6 +608,37 @@ openrouter:
   base_url: "${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}"
 ```
 
+### MCP Tool Servers
+
+TmuxAI can enhance its reasoning by calling Model Context Protocol (MCP) servers. At startup it looks for a `.mcp.json` file in the following locations (in order):
+
+1. The path specified in `TMUXAI_MCP_CONFIG`
+2. The current working directory
+3. `~/.config/tmuxai/.mcp.json`
+4. `~/.mcp.json`
+
+Each server entry defines the command that should be launched and optional arguments, environment variables, timeouts, or working directory. A minimal example:
+
+```json
+{
+  "mcpServers": {
+    "desktop-commander": {
+      "command": "npx",
+      "args": ["-y", "@smithery/cli@latest", "run", "@wonderwhy-er/desktop-commander"]
+    },
+    "github.com/marcopesani/mcp-server-serper": {
+      "command": "npx",
+      "args": ["-y", "serper-search-scrape-mcp-server"],
+      "env": {
+        "SERPER_API_KEY": "your-serper-api-key"
+      }
+    }
+  }
+}
+```
+
+When tools are available they are advertised to the model inside the system prompt. The assistant will issue tool calls using a single `<MCPToolCall>{...}</MCPToolCall>` block. TmuxAI executes the request, returns the result in a follow-up message that starts with `[MCP RESULT]`, and then the model continues with its normal response.
+
 ### Session-Specific Configuration
 
 You can override configuration values for your current TmuxAI session using the `/config` command:

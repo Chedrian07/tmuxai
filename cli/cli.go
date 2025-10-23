@@ -58,6 +58,7 @@ var rootCmd = &cobra.Command{
 			logger.Error("manager.NewManager failed: %v", err)
 			os.Exit(1)
 		}
+		defer mgr.Close()
 
 		// Load knowledge bases from CLI flag
 		if kbFlag != "" {

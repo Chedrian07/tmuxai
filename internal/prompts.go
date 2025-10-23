@@ -55,6 +55,12 @@ You have access to the following XML tags to control the tmux pane:
 <RequestAccomplished>: Use this boolean tag (value 1) when you have successfully completed and verified the user's request.
 `)
 
+	if m.MCPManager != nil && m.MCPManager.HasTools() {
+		builder.WriteString("\n")
+		builder.WriteString(m.MCPManager.InstructionPrompt())
+		builder.WriteString("\n")
+	}
+
 	if !prepared {
 		builder.WriteString(`<ExecPaneSeemsBusy>: Use this boolean tag (value 1) when you need to wait for the exec pane to finish before proceeding.`)
 	}
