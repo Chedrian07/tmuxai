@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -22,7 +23,87 @@ const (
 	defaultProtocolVersion  = "2025-03-26"
 	defaultRequestTimeout   = 60 * time.Second
 	defaultHandshakeTimeout = 60 * time.Second
+	probeTimeoutLimit       = 5 * time.Second
 )
+
+type messageCodec interface {
+	Name() string
+	Write(io.Writer, []byte) error
+	Read(*bufio.Reader) ([]byte, error)
+}
+
+type contentLengthCodec struct{}
+
+func (contentLengthCodec) Name() string { return "content-length" }
+
+func (contentLengthCodec) Write(w io.Writer, payload []byte) error {
+	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(payload))
+	if _, err := io.WriteString(w, header); err != nil {
+		return err
+	}
+	_, err := w.Write(payload)
+	return err
+}
+
+func (contentLengthCodec) Read(r *bufio.Reader) ([]byte, error) {
+	var contentLength int
+
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			break
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(parts[0]))
+		value := strings.TrimSpace(parts[1])
+		if key == "content-length" {
+			ln, err := strconv.Atoi(value)
+			if err != nil {
+				return nil, fmt.Errorf("invalid Content-Length value %q: %w", value, err)
+			}
+			contentLength = ln
+		}
+	}
+
+	if contentLength == 0 {
+		return nil, fmt.Errorf("content length header missing or zero")
+	}
+
+	buf := make([]byte, contentLength)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+type jsonlCodec struct{}
+
+func (jsonlCodec) Name() string { return "jsonl" }
+
+func (jsonlCodec) Write(w io.Writer, payload []byte) error {
+	if _, err := w.Write(payload); err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte{'\n'}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (jsonlCodec) Read(r *bufio.Reader) ([]byte, error) {
+	line, err := r.ReadBytes('\n')
+	if err != nil && len(line) == 0 {
+		return nil, err
+	}
+	return bytes.TrimSpace(line), nil
+}
 
 // Tool describes a single tool provided by an MCP server.
 type Tool struct {
@@ -97,6 +178,7 @@ type Server struct {
 	nextID      int64
 	closed      chan struct{}
 	once        sync.Once
+	codec       messageCodec
 
 	Instructions string
 	Tools        []Tool
@@ -107,6 +189,33 @@ func NewServer(ctx context.Context, name string, cfg ServerConfig, clientName, c
 		return nil, fmt.Errorf("mcp server %s has empty command", name)
 	}
 
+	codecs := []messageCodec{
+		contentLengthCodec{},
+		jsonlCodec{},
+	}
+
+	var lastErr error
+	for idx, codec := range codecs {
+		server, err := startServerWithCodec(ctx, name, cfg, clientName, clientVersion, codec, idx == len(codecs)-1)
+		if err == nil {
+			if idx > 0 {
+				logger.Info("[MCP:%s] using %s stdio framing", name, codec.Name())
+			} else {
+				logger.Debug("[MCP:%s] using %s stdio framing", name, codec.Name())
+			}
+			return server, nil
+		}
+		lastErr = err
+		logger.Debug("[MCP:%s] codec %s failed: %v", name, codec.Name(), err)
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("unknown error")
+	}
+	return nil, fmt.Errorf("failed to start MCP server %s: %w", name, lastErr)
+}
+
+func startServerWithCodec(ctx context.Context, name string, cfg ServerConfig, clientName, clientVersion string, codec messageCodec, isLast bool) (*Server, error) {
 	cmd := exec.CommandContext(ctx, cfg.Command, cfg.Args...)
 	if cfg.Cwd != "" {
 		cmd.Dir = cfg.Cwd
@@ -138,6 +247,7 @@ func NewServer(ctx context.Context, name string, cfg ServerConfig, clientName, c
 		stderr:  stderr,
 		pending: make(map[string]chan jsonrpcMessage),
 		closed:  make(chan struct{}),
+		codec:   codec,
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -147,7 +257,7 @@ func NewServer(ctx context.Context, name string, cfg ServerConfig, clientName, c
 	go server.consumeStdErr()
 	go server.listen()
 
-	if err := server.initialize(ctx, clientName, clientVersion); err != nil {
+	if err := server.initialize(ctx, clientName, clientVersion, !isLast); err != nil {
 		server.Close()
 		return nil, err
 	}
@@ -167,7 +277,7 @@ func (s *Server) consumeStdErr() {
 
 func (s *Server) listen() {
 	for {
-		frame, err := readFrame(s.reader)
+		frame, err := s.codec.Read(s.reader)
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				logger.Error("[MCP:%s] read error: %v", s.name, err)
@@ -209,7 +319,7 @@ func (s *Server) listen() {
 	}
 }
 
-func (s *Server) initialize(ctx context.Context, clientName, clientVersion string) error {
+func (s *Server) initialize(ctx context.Context, clientName, clientVersion string, allowFallback bool) error {
 	params := map[string]interface{}{
 		"protocolVersion": defaultProtocolVersion,
 		"capabilities": map[string]interface{}{
@@ -238,8 +348,13 @@ func (s *Server) initialize(ctx context.Context, clientName, clientVersion strin
 		handshakeTimeout = time.Duration(s.cfg.Timeout) * time.Second
 	}
 
-	logger.Info("[MCP:%s] Waiting up to %.0f seconds for initialize handshake", s.name, handshakeTimeout.Seconds())
-	if err := s.call(ctx, "initialize", params, &initResp, handshakeTimeout); err != nil {
+	probeTimeout := handshakeTimeout
+	if allowFallback && probeTimeout > probeTimeoutLimit {
+		probeTimeout = probeTimeoutLimit
+	}
+
+	logger.Info("[MCP:%s] Waiting up to %.0f seconds for initialize handshake", s.name, probeTimeout.Seconds())
+	if err := s.call(ctx, "initialize", params, &initResp, probeTimeout); err != nil {
 		return fmt.Errorf("initialize failed for MCP server %s: %w", s.name, err)
 	}
 
@@ -318,7 +433,7 @@ func (s *Server) call(ctx context.Context, method string, params interface{}, re
 	s.pending[strconv.FormatInt(id, 10)] = respCh
 	s.pendingLock.Unlock()
 
-	if err := writeFrame(s.stdin, payload); err != nil {
+	if err := s.codec.Write(s.stdin, payload); err != nil {
 		s.removePending(strconv.FormatInt(id, 10))
 		return err
 	}
@@ -361,7 +476,7 @@ func (s *Server) notify(method string, params interface{}) error {
 	if err != nil {
 		return err
 	}
-	return writeFrame(s.stdin, payload)
+	return s.codec.Write(s.stdin, payload)
 }
 
 func (s *Server) removePending(id string) {
